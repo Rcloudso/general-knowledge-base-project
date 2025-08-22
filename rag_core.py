@@ -1,12 +1,11 @@
 import os
 import time
+import hashlib
+import json
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from functools import lru_cache
-
 from loguru import logger
-from db_manager import DatabaseManager  # 导入数据库管理器
-
 from langchain_community.document_loaders import (
     DirectoryLoader,
     PyPDFLoader,
@@ -16,37 +15,80 @@ from langchain_community.document_loaders import (
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_openai import ChatOpenAI
-from langchain.chains import RetrievalQA
-from langchain.schema import Document
-from dotenv import load_dotenv
 
-# 配置日志
-logger.remove()  # 移除默认处理器
+# from langchain_core.embeddings import Embeddings
+from langchain_openai import ChatOpenAI
+from langchain.chains.retrieval_qa.base import RetrievalQA
+from langchain.schema import Document
+import datetime
+from dotenv import load_dotenv
+from db_manager import DatabaseManager
+
+
+# 日志处理
+logger.remove()
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+
+current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+
+main_log_filename = log_dir / f"{current_date}.log"
+
 logger.add(
-    "rag_core.log",
+    main_log_filename,
     rotation="10 MB",
+    retention="30 days",
     level="INFO",
     format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
-)  # 添加文件日志
+)
+
+
+# 动态日志级别处理类
+class LevelFileSink:
+    def __init__(self, log_dir, level):
+        self.log_dir = Path(log_dir)
+        self.level = level
+
+    def write(self, message):
+        record = message.record
+        if record["level"].name == self.level:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            level_log_filename = self.log_dir / f"{timestamp}_{self.level.lower()}.log"
+
+            with open(level_log_filename, "a", encoding="utf-8") as f:
+                f.write(
+                    f"{record['time'].strftime('%Y-%m-%d %H:%M:%S')} | {record['level'].name} | {record['message']}\n"
+                )
+
+
+# 为关键级别添加动态日志文件
+critical_levels = ["ERROR", "WARNING", "CRITICAL"]
+
+for level in critical_levels:
+    sink = LevelFileSink(log_dir, level)
+    logger.add(
+        sink.write,
+        filter=lambda record, level=level: record["level"].name == level,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+    )
+
 logger.add(
     lambda msg: print(msg),
     level="INFO",
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | <level>{message}</level>",
-)  # 添加控制台日志
+)
 
-# 加载环境变量
 load_dotenv()
 
 # 获取环境变量，提供默认值
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-# 使用与原数据库相同的嵌入模型，确保维度匹配
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL_NAME", "sentence-transformers/all-mpnet-base-v2"
 )
-OPENROUTER_MODEL_NAME = os.getenv("OPENROUTER_MODEL_NAME", "z-ai/glm-4.5-air:free")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "z-ai/glm-4.5-air:free")
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
-SESSIONS_DB_PATH = os.getenv("SESSIONS_DB_PATH", "./sessions.db")
+SESSIONS_DB_PATH = os.getenv("SESSIONS_DB_PATH", "./db/sessions.db")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 
 
 # 使用lru_cache缓存embedding模型，避免重复加载
@@ -54,7 +96,6 @@ SESSIONS_DB_PATH = os.getenv("SESSIONS_DB_PATH", "./sessions.db")
 def get_embeddings(model_name: str = EMBEDDING_MODEL_NAME) -> HuggingFaceEmbeddings:
     """获取并缓存embedding模型"""
     logger.info(f"Loading embedding model: {model_name}")
-    # 确保使用与原来相同维度的模型
     return HuggingFaceEmbeddings(model_name=model_name)
 
 
@@ -67,30 +108,22 @@ class RAGCore:
         """
         self.directory_path = directory_path
         self.db_path = CHROMA_DB_PATH
-
-        # 使用缓存获取embeddings模型
+        self.hash_file_path = Path(self.db_path) / "file_hashes.json"
         self.embeddings = get_embeddings()
 
-        # 检查API密钥是否存在
-        if not OPENROUTER_API_KEY:
-            logger.warning("OPENROUTER_API_KEY not found in environment variables")
+        if not OPENAI_API_KEY:
+            logger.warning("OPENAI_API_KEY not found in environment variables")
 
-        # 使用ChatOpenAI类初始化LLM，从环境变量获取配置
         self.llm = ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            openai_api_key=OPENROUTER_API_KEY,
-            model_name=OPENROUTER_MODEL_NAME,
-            default_headers={"HTTP-Referer": "https://localhost:3000"},
+            base_url=OPENAI_BASE_URL,
+            openai_api_key=OPENAI_API_KEY,
+            model_name=OPENAI_MODEL_NAME,
         )
-
         self.db = None
         self.qa_chain = None
-        
-        # 初始化数据库管理器
         self.db_manager = DatabaseManager(SESSIONS_DB_PATH)
         self.current_session_id = None
 
-        # 如果提供了目录路径，则创建数据库
         if directory_path:
             self.create_database()
 
@@ -130,7 +163,7 @@ class RAGCore:
         all_docs = []
 
         for encoding in encodings:
-            if all_docs:  # 如果已经成功加载了文档，就不再尝试其他编码
+            if all_docs:
                 break
 
             docs = self._load_documents_by_type(
@@ -147,41 +180,165 @@ class RAGCore:
 
         return all_docs
 
+    def _calculate_file_hash(self, file_path: str) -> str:
+        """计算文件的SHA256哈希值"""
+        try:
+            with open(file_path, "rb") as f:
+                file_hash = hashlib.sha256()
+                for chunk in iter(lambda: f.read(4096), b""):
+                    file_hash.update(chunk)
+                return file_hash.hexdigest()
+        except Exception as e:
+            logger.error(f"Error calculating hash for {file_path}: {e}")
+            return ""
+
+    def _load_file_hashes(self) -> Dict[str, Dict[str, Any]]:
+        if not self.hash_file_path.exists():
+            return {}
+        try:
+            with open(self.hash_file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading file hashes: {e}")
+            return {}
+
+    def _save_file_hashes(self, file_hashes: Dict[str, Dict[str, Any]]) -> None:
+        """保存文件哈希信息"""
+        try:
+            self.hash_file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.hash_file_path, "w", encoding="utf-8") as f:
+                json.dump(file_hashes, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving file hashes: {e}")
+
+    def _normalize_path(self, file_path: str) -> str:
+        """规范化文件路径，确保路径格式统一
+
+        Args:
+            file_path: 原始文件路径
+
+        Returns:
+            规范化后的文件路径
+        """
+        if file_path.startswith("./") or file_path.startswith(".\\"):
+            file_path = file_path[2:]
+
+        abs_path = os.path.abspath(file_path)
+        cwd = os.path.abspath(os.getcwd())
+        if abs_path.startswith(cwd):
+            rel_path = os.path.relpath(abs_path, cwd)
+            return rel_path.replace("\\", "/")
+        else:
+            return file_path.replace("\\", "/")
+
+    def _get_modified_files(self, file_hashes: Dict[str, Dict[str, Any]]) -> List[str]:
+        """获取新增或修改的文件列表"""
+        if not self.directory_path:
+            return []
+        modified_files = []
+        supported_extensions = {".pdf", ".txt", ".doc", ".docx"}
+        current_files = set()
+
+        normalized_to_original = {}
+        normalized_hashes = {}
+
+        for original_path, hash_info in file_hashes.items():
+            norm_path = self._normalize_path(original_path)
+            normalized_hashes[norm_path] = hash_info
+            normalized_to_original[norm_path] = original_path
+
+        for root, dirs, files in os.walk(self.directory_path):
+            for file in files:
+                file_path = os.path.join(root, file)
+                file_ext = Path(file).suffix.lower()
+                if file_ext in supported_extensions:
+                    norm_file_path = self._normalize_path(file_path)
+                    current_files.add(norm_file_path)
+                    current_hash = self._calculate_file_hash(file_path)
+                    current_mtime = os.path.getmtime(file_path)
+
+                    if norm_file_path not in normalized_hashes:
+                        modified_files.append(file_path)
+                        logger.info(f"New file detected: {file_path}")
+                    else:
+                        stored_hash = normalized_hashes[norm_file_path].get("hash", "")
+                        stored_mtime = normalized_hashes[norm_file_path].get("mtime", 0)
+                        if current_hash != stored_hash or current_mtime != stored_mtime:
+                            modified_files.append(file_path)
+                            logger.info(f"Modified file detected: {file_path}")
+
+        deleted_files = []
+        for norm_path in normalized_hashes.keys():
+            original_path = normalized_to_original.get(norm_path, norm_path)
+            if (
+                norm_path not in current_files
+                and os.path.exists(original_path) is False
+            ):
+                deleted_files.append(original_path)
+                logger.info(f"Deleted file detected: {original_path}")
+
+        if deleted_files:
+            for deleted_file in deleted_files:
+                norm_deleted = self._normalize_path(deleted_file)
+                for original_path in list(file_hashes.keys()):
+                    if self._normalize_path(original_path) == norm_deleted:
+                        del file_hashes[original_path]
+
+            self._save_file_hashes(file_hashes)
+            logger.info(
+                f"Cleaned up {len(deleted_files)} deleted files from hash records"
+            )
+
+        return modified_files
+
     def load_documents(self) -> List[Document]:
-        """从指定目录加载所有支持的文档类型"""
+        """从指定目录加载所有支持的文档类型（支持增量更新）"""
         if not self.directory_path:
             logger.error("No directory path specified")
             return []
 
-        # 确保目录存在
         if not os.path.exists(self.directory_path):
             logger.error(f"Directory does not exist: {self.directory_path}")
             return []
 
         logger.info(f"Loading documents from {self.directory_path}")
+
+        file_hashes = self._load_file_hashes()
+        modified_files = self._get_modified_files(file_hashes)
+
+        if not modified_files:
+            logger.info("No new or modified files detected")
+            return []
+
         documents = []
+        for file_path in modified_files:
+            file_ext = Path(file_path).suffix.lower()
+            try:
+                if file_ext == ".pdf":
+                    docs = PyPDFLoader(file_path).load()
+                elif file_ext == ".txt":
+                    docs = None
+                    for encoding in ["utf-8", "gbk", "gb2312", "gb18030", "big5"]:
+                        try:
+                            docs = TextLoader(file_path, encoding=encoding).load()
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    if not docs:
+                        continue
+                elif file_ext in [".doc", ".docx"]:
+                    docs = UnstructuredWordDocumentLoader(file_path).load()
+                else:
+                    continue
+                documents.extend(docs)
+                logger.info(f"Loaded {len(docs)} documents from {file_path}")
 
-        # 加载PDF文件
-        pdf_docs = self._load_documents_by_type("**/*.pdf", PyPDFLoader)
-        documents.extend(pdf_docs)
+            except Exception as e:
+                logger.error(f"Error loading file {file_path}: {e}")
 
-        # 加载TXT文件（尝试多种编码）
-        txt_docs = self._load_txt_documents()
-        documents.extend(txt_docs)
-
-        # 加载DOC文件
-        doc_docs = self._load_documents_by_type(
-            "**/*.doc", UnstructuredWordDocumentLoader
+        logger.info(
+            f"Total documents loaded: {len(documents)} (from {len(modified_files)} modified files)"
         )
-        documents.extend(doc_docs)
-
-        # 加载DOCX文件
-        docx_docs = self._load_documents_by_type(
-            "**/*.docx", UnstructuredWordDocumentLoader
-        )
-        documents.extend(docx_docs)
-
-        logger.info(f"Total documents loaded: {len(documents)}")
         return documents
 
     def split_documents(self, documents: List[Document]) -> List[Document]:
@@ -204,31 +361,99 @@ class RAGCore:
         return texts
 
     def create_database(self) -> bool:
-        """从文档创建Chroma向量数据库
+        """从文档创建Chroma向量数据库（支持增量更新）
 
         Returns:
             是否成功创建数据库
         """
         logger.info("Loading documents...")
         documents = self.load_documents()
+
+        self.clean_file_hashes()
+
+        file_hashes = self._load_file_hashes()
+
         if not documents:
-            logger.warning("No documents found in the specified directory.")
-            return False
+            if os.path.exists(self.db_path):
+                logger.info("Database already exists and no new files detected")
+                return self.load_database()
+            else:
+                logger.warning("No documents found in the specified directory.")
+                return False
 
         logger.info("Splitting documents...")
         texts = self.split_documents(documents)
 
-        logger.info("Creating Chroma vector database...")
+        logger.info("Creating/updating Chroma vector database...")
         try:
-            self.db = Chroma.from_documents(
-                texts, self.embeddings, persist_directory=self.db_path
-            )
-            self.db.persist()
-            logger.info(f"Database created successfully at {self.db_path}")
+            # 更新文件哈希信息
+            for file_path in self._get_modified_files(file_hashes):
+                if os.path.exists(file_path):
+                    # 使用规范化的路径作为键
+                    norm_path = self._normalize_path(file_path)
+                    file_hashes[norm_path] = {
+                        "hash": self._calculate_file_hash(file_path),
+                        "mtime": os.path.getmtime(file_path),
+                    }
+            self._save_file_hashes(file_hashes)
+            if os.path.exists(self.db_path):
+                existing_db = Chroma(
+                    persist_directory=self.db_path, embedding_function=self.embeddings
+                )
+                existing_db.add_documents(texts)
+                self.db = existing_db
+                logger.info(f"Database updated successfully at {self.db_path}")
+            else:
+                self.db = Chroma.from_documents(
+                    texts, self.embeddings, persist_directory=self.db_path
+                )
+                logger.info(f"Database created successfully at {self.db_path}")
+
             self.setup_qa_chain()
             return True
         except Exception as e:
-            logger.error(f"Error creating database: {e}")
+            logger.error(f"Error creating/updating database: {e}")
+            return False
+
+    def clean_file_hashes(self) -> bool:
+        """清理文件哈希记录，移除重复的文件记录
+
+        Returns:
+            是否成功清理文件哈希记录
+        """
+        try:
+            file_hashes = self._load_file_hashes()
+            if not file_hashes:
+                logger.info("No file hash records to clean")
+                return True
+
+            normalized_paths = {}
+            cleaned_hashes = {}
+
+            # 遍历所有文件哈希记录
+            for original_path, hash_info in file_hashes.items():
+                norm_path = self._normalize_path(original_path)
+                if norm_path in normalized_paths:
+                    # 比较修改时间，保留最新的记录
+                    existing_mtime = cleaned_hashes[normalized_paths[norm_path]].get(
+                        "mtime", 0
+                    )
+                    current_mtime = hash_info.get("mtime", 0)
+                    if current_mtime > existing_mtime:
+                        cleaned_hashes[norm_path] = hash_info
+                        normalized_paths[norm_path] = norm_path
+                        logger.info(f"Replaced duplicate record for {norm_path}")
+                else:
+                    cleaned_hashes[norm_path] = hash_info
+                    normalized_paths[norm_path] = norm_path
+
+            self._save_file_hashes(cleaned_hashes)
+            logger.info(
+                f"Cleaned file hash records: {len(file_hashes)} -> {len(cleaned_hashes)}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error cleaning file hash records: {e}")
             return False
 
     def load_database(self, force_recreate: bool = False) -> bool:
@@ -255,13 +480,11 @@ class RAGCore:
                     backup_path = f"{self.db_path}_backup_{int(time.time())}"
                     shutil.copytree(self.db_path, backup_path)
                     logger.info(f"Backed up existing database to {backup_path}")
-                    # 删除原数据库
                     shutil.rmtree(self.db_path)
                     logger.info(f"Removed existing database at {self.db_path}")
                 except Exception as e:
                     logger.error(f"Error backing up/removing database: {e}")
 
-            # 如果有文档目录，创建新数据库
             if self.directory_path:
                 return self.create_database()
             else:
@@ -270,7 +493,6 @@ class RAGCore:
                 )
                 return False
 
-        # 正常加载数据库
         if os.path.exists(self.db_path):
             try:
                 self.db = Chroma(
@@ -281,7 +503,6 @@ class RAGCore:
                 return True
             except Exception as e:
                 logger.error(f"Error loading database: {e}")
-                # 如果是维度不匹配错误且有文档目录，建议重新创建
                 if "dimension" in str(e).lower() and self.directory_path:
                     logger.warning(
                         "Embedding dimension mismatch detected. Try running with --force-recreate"
@@ -294,8 +515,14 @@ class RAGCore:
         """设置问答链用于回答问题"""
         logger.info("Setting up QA chain...")
         if self.db:
-            # 使用与query_stream方法相同的检索参数
-            retriever = self.db.as_retriever(search_kwargs={"k": 6})
+            retriever = self.db.as_retriever(
+                # 高精度相似度检索
+                # search_type="similarity_score_threshold",
+                # search_kwargs={"k": 6, "score_threshold": 0.7},
+                # 最大边际相关性检索
+                search_type="mmr",
+                search_kwargs={"k": 4, "lambda_mult": 0.5},
+            )
             self.qa_chain = RetrievalQA.from_chain_type(
                 llm=self.llm,
                 chain_type="stuff",
@@ -319,27 +546,25 @@ class RAGCore:
 
         logger.info(f"Processing question: {question}")
         try:
-            # 使用invoke方法替代直接调用，解决Chain.__call__弃用警告
             result = self.qa_chain.invoke({"query": question})
             logger.info("Question answered successfully")
             return result["result"], result["source_documents"]
         except Exception as e:
             logger.error(f"Error answering question: {e}")
             return f"Error processing question: {str(e)}", []
-            
+
     def create_session(self, session_id=None):
         """创建新的会话
-        
+
         Args:
             session_id: 会话ID，如果不提供则自动生成
-            
+
         Returns:
             会话ID
         """
         if session_id is None:
             session_id = f"session_{int(time.time())}"
-        
-        # 系统提示消息
+
         system_message = """你是一个有用的AI助手，请根据会话历史和参考资料回答问题。
 
 遵循以下规则：
@@ -350,19 +575,18 @@ class RAGCore:
 5. 如果会话历史和参考资料中都没有相关信息，请如实告知用户。
 6. 回答要简洁明了，直接回应用户的问题。
 7. 不要编造信息，只使用会话历史和提供的参考资料。"""
-        
-        # 使用数据库管理器创建会话
+
         self.db_manager.create_session(session_id, system_message)
         self.current_session_id = session_id
         logger.info(f"Created new session: {session_id}")
         return session_id
-        
+
     def switch_session(self, session_id):
         """切换到指定会话
-        
+
         Args:
             session_id: 要切换到的会话ID
-            
+
         Returns:
             是否成功切换
         """
@@ -373,28 +597,28 @@ class RAGCore:
         else:
             logger.warning(f"Session {session_id} not found")
             return False
-            
+
     def add_message(self, role, content):
         """向当前会话添加消息
-        
+
         Args:
             role: 消息角色 ("user", "assistant", "system")
             content: 消息内容
-            
+
         Returns:
             是否成功添加
         """
         if not self.current_session_id:
             self.create_session()
-            
+
         return self.db_manager.add_message(self.current_session_id, role, content)
-        
+
     def get_session_messages(self, session_id=None):
         """获取指定会话的所有消息
-        
+
         Args:
             session_id: 会话ID，如果不提供则使用当前会话
-            
+
         Returns:
             会话消息列表
         """
@@ -402,37 +626,36 @@ class RAGCore:
         if not session_id:
             return []
         return self.db_manager.get_session_messages(session_id)
-        
+
     def list_sessions(self):
         """列出所有会话
-        
+
         Returns:
             会话ID和创建时间的列表
         """
         return self.db_manager.list_sessions()
-        
+
     def delete_session(self, session_id):
         """删除指定会话
-        
+
         Args:
             session_id: 要删除的会话ID
-            
+
         Returns:
             是否成功删除
         """
         result = self.db_manager.delete_session(session_id)
-        
-        # 如果删除的是当前会话，则重置当前会话ID
+
         if result and self.current_session_id == session_id:
             self.current_session_id = None
-            
+
         if result:
             logger.info(f"Deleted session: {session_id}")
         else:
             logger.warning(f"Session {session_id} not found for deletion")
-            
+
         return result
-    
+
     def query_stream(self, question: str, session_id=None):
         """使用问答链回答问题，支持流式输出，并保存会话上下文
 
@@ -447,8 +670,7 @@ class RAGCore:
             logger.error("QA chain not set up. Please load or create a database first.")
             yield "QA chain is not set up. Please create or load a database first.", []
             return
-            
-        # 确保有活跃会话
+
         if session_id:
             if not self.db_manager.session_exists(session_id):
                 self.create_session(session_id)
@@ -456,53 +678,55 @@ class RAGCore:
                 self.current_session_id = session_id
         elif not self.current_session_id:
             self.create_session()
-            
-        # 添加原始用户问题到会话
+
         self.add_message("user", question)
 
         logger.info(f"Processing question with streaming: {question}")
         try:
-            # 获取检索到的文档，增加检索数量以提高相关性
             retriever = self.db.as_retriever(search_kwargs={"k": 6})
             docs = retriever.invoke(question)
-            
-            # 按相关性分数排序文档（如果有分数）
-            if hasattr(docs[0], 'metadata') and 'score' in docs[0].metadata:
-                docs = sorted(docs, key=lambda x: x.metadata.get('score', 0), reverse=True)
-            
-            # 准备检索到的文档内容作为参考，添加文档来源信息
+
+            if hasattr(docs[0], "metadata") and "score" in docs[0].metadata:
+                docs = sorted(
+                    docs, key=lambda x: x.metadata.get("score", 0), reverse=True
+                )
+
             context_parts = []
             for i, doc in enumerate(docs):
-                source = doc.metadata.get('source', '未知来源') if hasattr(doc, 'metadata') else '未知来源'
-                context_parts.append(f"文档{i+1}（来源：{source}）:\n{doc.page_content}")
+                source = (
+                    doc.metadata.get("source", "未知来源")
+                    if hasattr(doc, "metadata")
+                    else "未知来源"
+                )
+                context_parts.append(
+                    f"文档{i+1}（来源：{source}）:\n{doc.page_content}"
+                )
             context = "\n\n".join(context_parts)
-            
-            # 获取会话历史消息作为上下文
+
             messages = self.get_session_messages()
-            
-            # 移除最后一条用户消息，因为我们将添加带有参考资料的增强版本
+
             if messages and messages[-1]["role"] == "user":
                 messages.pop()
-            
-            # 添加当前问题和检索到的文档内容作为单独的用户消息
-            messages.append({"role": "user", "content": f"问题：{question}\n\n参考资料（按相关性排序）：\n{context}"})
-            
-            # 添加提示，引导模型关注相关内容
+
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"问题：{question}\n\n参考资料（按相关性排序）：\n{context}",
+                }
+            )
+
             if len(docs) > 0:
                 logger.info(f"Retrieved {len(docs)} documents for question: {question}")
             else:
-                logger.warning(f"No documents retrieved for question: {question}")            
-            
-            # 使用流式输出
+                logger.warning(f"No documents retrieved for question: {question}")
+
             response = ""
             for chunk in self.llm.stream(messages):
                 if chunk.content:
                     response += chunk.content
                     yield response, docs
-            
-            # 添加助手回答到会话
+
             self.add_message("assistant", response)
-                    
             logger.info("Streaming question answered successfully")
         except Exception as e:
             logger.error(f"Error streaming answer: {e}")
@@ -529,9 +753,7 @@ def main():
 
     args = parser.parse_args()
 
-    # 设置日志级别
     if args.debug:
-        # 使用loguru的方式设置日志级别
         logger.remove()
         logger.add("rag_core.log", rotation="10 MB", level="DEBUG")
         logger.add(lambda msg: print(msg), level="DEBUG")
@@ -546,9 +768,8 @@ def main():
 
     rag = RAGCore(**rag_kwargs)
 
-    # 加载或创建数据库
     if args.create_db or not rag.load_database(force_recreate=args.force_recreate):
-        if not args.force_recreate:  # 避免重复创建
+        if not args.force_recreate:
             logger.info("Creating new database...")
             if not rag.create_database():
                 logger.error("Failed to create database. Exiting.")

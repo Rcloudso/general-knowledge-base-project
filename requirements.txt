@@ -1,8 +1,6 @@
 streamlit
 chromadb
-sentence-transformers
 openai
-tiktoken
 langchain
 langchain-openai
 langchain_chroma
@@ -11,4 +9,7 @@ langchain-huggingface
 loguru
 unstructured
 PyPDF[crypto]
-python-magic-bin
+python-docx
+# tiktoken
+# python-magic-bin
+# sentence-transformers
