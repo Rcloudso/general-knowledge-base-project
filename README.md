@@ -1,34 +1,40 @@
-# RAG知识库问答系统
+# RAG 知识库问答系统
 
-一个基于检索增强生成（Retrieval-Augmented Generation, RAG）技术的智能知识库问答系统，能够从本地文档中提取信息并提供准确的问答服务。已简单自测四本古籍的问答功能，通过streamlit启动web应用尚存在回答不准的问题。
+一个基于检索增强生成（Retrieval-Augmented Generation, RAG）技术的智能知识库问答系统，能够从本地文档中提取信息并提供准确的问答服务。已简单自测四本古籍的问答功能，通过 streamlit 启动 web 应用尚存在回答不准的问题。
 
 ## ✨ 核心功能
 
 ### 📄 多格式文档支持
+
 - 支持 PDF、TXT、DOC/DOCX 等多种文档格式
-- 自动处理中文编码（UTF-8、GBK、GB2312等）
+- 自动处理中文编码（UTF-8、GBK、GB2312 等）
 
 ### 🔍 智能检索能力
+
 - 基于向量数据库的语义搜索
 - 支持相似度检索和关键词匹配
 - 自动文档分块和向量化处理
 
-### 🤖 AI问答生成
+### 🤖 AI 问答生成
+
 - 集成 OpenAI API 进行智能问答
 - 支持上下文感知的多轮对话
 - 实时流式输出响应
 
 ### ⚙️ 配置管理
+
 - 环境变量配置系统
 - 模型缓存机制，避免重复下载
 - 灵活的数据库管理
 
 ### 📊 日志与监控
+
 - 使用 loguru 进行高级日志管理
 - 彩色控制台输出
 - 日志文件轮转和归档
 
 ### 💬 会话管理
+
 - 完整的对话历史保存
 - 上下文感知的问答生成
 - 支持会话恢复和导出（后续迭代）
@@ -36,8 +42,9 @@
 ## 🚀 快速开始
 
 ### 环境要求
+
 - Python 3.8+
-- 支持CUDA的GPU（可选，用于加速处理）
+- 支持 CUDA 的 GPU（可选，用于加速处理）
 
 ### 安装依赖
 
@@ -46,14 +53,16 @@
 conda create -n rag_env python=3.10
 conda activate rag_env
 ```
+
 或者
 
 ```bash
 python -m venv venv
 source venv/bin/activate  # Linux/Mac
 venv\Scripts\activate  # Windows
+```
 
-
+```bash
 # 克隆项目
 git clone https://github.com/Rcloudso/general-knowledge-base-project
 cd general-knowledge-base-project
@@ -69,6 +78,7 @@ pip install -r requirements.txt
 在运行程序前，请设置以下环境变量：
 
 #### 方法一：命令行设置
+
 ```bash
 # Linux/Mac
 export OPENAI_API_KEY="your-openai-api-key"
@@ -93,6 +103,7 @@ set CHROMA_DB_PATH=./chroma_db
 ```
 
 #### 方法二：创建 `.env` 文件
+
 ```env
 # OpenRouter API配置
 OPENAI_API_KEY=your-openai-api-key
@@ -114,20 +125,23 @@ LOG_FILE=./logs/app.log
 # HTTPS_PROXY=http://proxy.example.com:8080
 ```
 
-#### 获取API密钥
-1. 访问 [OpenAI官网](https://openai.com/) 或者任意支持OpenAI API的模型提供商注册账号
-2. 在控制台获取API密钥
+#### 获取 API 密钥
+
+1. 访问 [OpenAI 官网](https://openai.com/) 或者任意支持 OpenAI API 的模型提供商注册账号
+2. 在控制台获取 API 密钥
 3. 将密钥设置到环境变量或 `.env` 文件中
 
 ### 支持的模型
-- **嵌入模型**: BAAI/bge-small-zh-v1.5, BAAI/bge-large-zh-v1.5, 其他HuggingFace模型
-- **LLM模型**: 所有OpenAI支持的模型（GPT-3.5, GPT-4, Claude, Gemini等）
+
+- **嵌入模型**: BAAI/bge-small-zh-v1.5, BAAI/bge-large-zh-v1.5, 其他 HuggingFace 模型
+- **LLM 模型**: 所有 OpenAI 支持的模型（GPT-3.5, GPT-4, Claude, Gemini 等）
 
 ## 🎯 使用方法
 
 ### 基本使用
 
 1. **启动应用**:
+
    ```bash
    python rag_core.py
    ```
@@ -163,6 +177,7 @@ python rag_core.py --help
 ```
 
 ### 交互命令
+
 - `/help` - 显示帮助信息
 - `/exit` - 退出程序
 
@@ -206,6 +221,7 @@ General Knowledge Base/
 ├── 📄 README.md             # 项目说明
 └── 📄 .gitignore           # Git忽略文件
 ```
+
 ## 注意事项
 
 - 首次运行时需要下载嵌入模型，可能需要一些时间
@@ -222,10 +238,11 @@ General Knowledge Base/
 ## 🤝 致谢
 
 感谢以下开源项目和技术：
-- [OpenAI](https://openai.com/) - 提供多模型LLM API服务
+
+- [OpenAI](https://openai.com/) - 提供多模型 LLM API 服务
 - [ChromaDB](https://www.trychroma.com/) - 开源向量数据库
 - [HuggingFace](https://huggingface.co/) - 提供优秀的嵌入模型
-- [LangChain](https://www.langchain.com/) - LLM应用开发框架
+- [LangChain](https://www.langchain.com/) - LLM 应用开发框架
 
 ---
 
