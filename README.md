@@ -42,9 +42,21 @@
 ### 安装依赖
 
 ```bash
+# 创建环境
+conda create -n rag_env python=3.10
+conda activate rag_env
+```
+或者
+
+```bash
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+venv\Scripts\activate  # Windows
+
+
 # 克隆项目
 git clone https://github.com/Rcloudso/general-knowledge-base-project
-cd General-Knowledge-Base
+cd general-knowledge-base-project
 
 # 安装依赖
 pip install -r requirements.txt
